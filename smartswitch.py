@@ -1,7 +1,7 @@
 from flask import Flask
 import paho.mqtt.client as mqtt
 
-app = Flask(name)
+app = Flask(__name__)
 
 # MQTT Settings
 MQTT_BROKER = "test.mosquitto.org"
