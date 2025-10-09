@@ -8,9 +8,9 @@ MQTT_BROKER = "test.mosquitto.org"
 MQTT_PORT = 1883
 client = mqtt.Client()
 
-# Connect to MQTT broker
 def on_connect(client, userdata, flags, rc):
     print("✅ Connected to MQTT Broker with code:", rc)
+
 client.on_connect = on_connect
 client.connect(MQTT_BROKER, MQTT_PORT, 60)
 client.loop_start()
