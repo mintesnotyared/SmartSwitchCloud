@@ -1,0 +1,6 @@
+services:
+  - type: worker
+    name: smartswitch-scheduler
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python smartswitch.py
