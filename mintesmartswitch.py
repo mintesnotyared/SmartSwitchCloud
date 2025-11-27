@@ -1,4 +1,4 @@
-# Combined Scheduler: Timer + Alarm + Calendar for ESP12F
+# Minte Smart Switch Combined Scheduler: Timer + Alarm + Calendar for ESP12F
 import paho.mqtt.client as mqtt
 import json
 import time
