@@ -1,4 +1,7 @@
-#Minte Smart Switch Python Code. For Render
+
+# Minte Smart Switch Python Code for Render.com
+# Combined Scheduler: Timer + Alarm + Calendar for ESP12F
+
 import paho.mqtt.client as mqtt
 import json
 import time
@@ -17,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 class CombinedScheduler:
     def init(self):
+        # Initialize client first
         self.client = mqtt.Client()
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
@@ -372,10 +376,14 @@ class CombinedScheduler:
     def start_schedule_checker(self):
         def schedule_check_loop():
             while True:
-                self.check_timers()
-                self.check_alarms()
-                self.check_events()
-                time.sleep(1)
+                try:
+                    self.check_timers()
+                    self.check_alarms()
+                    self.check_events()
+                    time.sleep(1)
+                except Exception as e:
+                    logger.error(f"Error in schedule checker: {e}")
+                    time.sleep(5)
         
         thread = threading.Thread(target=schedule_check_loop, daemon=True)
         thread.start()
@@ -398,11 +406,25 @@ class CombinedScheduler:
             logger.info("="*70 + "\n")
             
             # Start MQTT in background thread
-            mqtt_thread = threading.Thread(target=self.client.loop_forever, daemon=True)
+            mqtt_thread = threading.Thread(target=self.mqtt_loop, daemon=True)
             mqtt_thread.start()
             
         except Exception as e:
             logger.error(f"💥 Failed to connect to MQTT: {e}")
+    
+    def mqtt_loop(self):
+        """Run MQTT loop forever with error handling"""
+        while True:
+            try:
+                self.client.loop_forever()
+            except Exception as e:
+                logger.error(f"MQTT loop error: {e}")
+                time.sleep(5)
+                # Try to reconnect
+                try:
+                    self.client.reconnect()
+                except:
+                    pass
 
 # Flask routes for Render health checks
 @app.route('/')
@@ -410,7 +432,12 @@ def home():
     return jsonify({
         "status": "online",
         "service": "Minte Smart Switch Scheduler",
-        "endpoints": ["/health", "/status"]
+        "endpoints": ["/health", "/status", "/mqtt"],
+        "docs": {
+            "timer": "Publish to 'philos/timer/add' with JSON: {'id':'unique','hours':0,'minutes':5,'seconds':0,'switch':1,'action':'ON','label':'Timer'}",
+            "alarm": "Publish to 'smart/alarm/add' with JSON: {'channel':1,'hour':8,'minute':30,'action':'ON','days':[1,2,3,4,5]}",
+            "calendar": "Publish to 'philos/calendar/add' with JSON: {'id':'unique','date':'2024-01-01','time':'08:00','switch':1,'action':'ON','repeatMode':'daily'}"
+        }
     })
 
 @app.route('/health')
@@ -425,27 +452,58 @@ def status():
             "timers": len(scheduler.timers),
             "alarms": len(scheduler.alarms),
             "events": len(scheduler.events),
-            "mqtt_connected": scheduler.client.is_connected()
+            "mqtt_connected": scheduler.client.is_connected() if hasattr(scheduler, 'client') else False
         })
     return jsonify({"error": "Scheduler not initialized"})
 
+@app.route('/mqtt')
+def mqtt_status():
+    scheduler = app.config.get('scheduler')
+    if scheduler and hasattr(scheduler, 'client'):
+        return jsonify({
+            "connected": scheduler.client.is_connected(),
+            "broker": "broker.emqx.io:1883",
+            "topics": [
+                "philos/timer/add",
+                "smart/alarm/add", 
+                "philos/calendar/add",
+                "smartSwitch/app/cmd1-4"
+            ]
+        })
+    return jsonify({"error": "MQTT client not available"})
+
+# Global scheduler instance
+scheduler_instance = None
+
 def main():
-    # Initialize scheduler
-    scheduler = CombinedScheduler()
+    global scheduler_instance
     
-    # Store scheduler in Flask app config
-    app.config['scheduler'] = scheduler
-    
-    # Start MQTT in background
-    scheduler.start_mqtt()
-    
-    # Get port from Render environment or default
-    port = int(os.environ.get("PORT", 10000))
-    
-    logger.info(f"🌐 Starting Flask server on port {port}")
-    
-    # Start Flask server
-    app.run(host='0.0.0.0', port=port, debug=False)
+    try:
+        # Initialize scheduler
+        scheduler_instance = CombinedScheduler()
+        
+        # Store scheduler in Flask app config
+        app.config['scheduler'] = scheduler_instance
+        
+        # Start MQTT in background with error handling
+        mqtt_thread = threading.Thread(target=scheduler_instance.start_mqtt, daemon=True)
+        mqtt_thread.start()
+        
+        # Give MQTT time to connect
+        time.sleep(2)
+        
+        # Get port from Render environment or default
+        port = int(os.environ.get("PORT", 10000))
+        
+        logger.info(f"🌐 Starting Flask server on port {port}")
+        logger.info(f"🌍 Service URL: https://smartswitchcloud.onrender.com")
+        
+        # Start Flask server
+        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+        
+    except Exception as e:
+        logger.error(f"💥 Failed to start application: {e}")
+        raise
 
 if __name__ == "__main__":
     main()
