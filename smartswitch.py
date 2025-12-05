@@ -5,7 +5,6 @@ import time
 from datetime import datetime, timedelta
 import threading
 import os
-import schedule
 from flask import Flask, jsonify
 import logging
 
