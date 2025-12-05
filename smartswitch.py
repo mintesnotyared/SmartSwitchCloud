@@ -10,6 +10,7 @@ import threading
 import os
 from flask import Flask, jsonify
 import logging
+from enum import Enum
 
 # Flask app for Render health checks
 app = Flask(__name__)
@@ -18,10 +19,18 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Enum for repeat modes
+class RepeatMode(Enum):
+    ONCE = 'once'
+    DAILY = 'daily'
+    WEEKLY = 'weekly'
+    MONTHLY = 'monthly'
+    YEARLY = 'yearly'
+
 class CombinedScheduler:
     def __init__(self):
         # Initialize client first
-        self.client = mqtt.Client()
+        self.client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)  # Fixed API version
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
         
@@ -33,6 +42,7 @@ class CombinedScheduler:
         # Data files - use /tmp for Render's ephemeral filesystem
         self.timers_file = "/tmp/active_timers.json"
         self.events_file = "/tmp/calendar_events.json"
+        self.alarms_file = "/tmp/active_alarms.json"
         
         # MQTT topics - Unified for ESP12F
         self.topic_switch_base = "smartSwitch/app/cmd"
@@ -55,10 +65,20 @@ class CombinedScheduler:
         
         # Load existing data
         self.load_timers()
+        self.load_alarms()
         self.load_events()
         
         logger.info("🤖 Combined Scheduler: Timer + Alarm + Calendar Initialized")
         logger.info(f"📊 Loaded {len(self.timers)} timers, {len(self.alarms)} alarms, {len(self.events)} events")
+    
+    # ========== HELPER FUNCTIONS ==========
+    def datetime_to_str(self, dt):
+        """Convert datetime to ISO string"""
+        return dt.isoformat() if dt else None
+    
+    def str_to_datetime(self, s):
+        """Convert ISO string to datetime"""
+        return datetime.fromisoformat(s) if s else None
     
     # ========== TIMER FUNCTIONS ==========
     def load_timers(self):
@@ -67,7 +87,8 @@ class CombinedScheduler:
                 with open(self.timers_file, 'r') as f:
                     saved_timers = json.load(f)
                     for timer in saved_timers:
-                        timer['end_time'] = datetime.fromisoformat(timer['end_time'])
+                        timer['end_time'] = self.str_to_datetime(timer['end_time'])
+                        timer['created_at'] = self.str_to_datetime(timer['created_at'])
                     self.timers = saved_timers
                 logger.info(f"✅ Loaded {len(self.timers)} timers")
         except Exception as e:
@@ -79,7 +100,9 @@ class CombinedScheduler:
             timers_to_save = []
             for timer in self.timers:
                 timer_copy = timer.copy()
-                timer_copy['end_time'] = timer['end_time'].isoformat()
+                # Convert datetime objects to strings
+                timer_copy['end_time'] = self.datetime_to_str(timer['end_time'])
+                timer_copy['created_at'] = self.datetime_to_str(timer['created_at'])
                 timers_to_save.append(timer_copy)
             with open(self.timers_file, 'w') as f:
                 json.dump(timers_to_save, f, indent=2)
@@ -143,6 +166,23 @@ class CombinedScheduler:
             logger.error(f"💥 Error cancelling timer: {e}")
     
     # ========== ALARM FUNCTIONS ==========
+    def load_alarms(self):
+        try:
+            if os.path.exists(self.alarms_file):
+                with open(self.alarms_file, 'r') as f:
+                    self.alarms = json.load(f)
+                logger.info(f"✅ Loaded {len(self.alarms)} alarms")
+        except Exception as e:
+            logger.error(f"❌ Error loading alarms: {e}")
+            self.alarms = []
+    
+    def save_alarms(self):
+        try:
+            with open(self.alarms_file, 'w') as f:
+                json.dump(self.alarms, f, indent=2)
+        except Exception as e:
+            logger.error(f"❌ Error saving alarms: {e}")
+    
     def add_alarm(self, payload):
         try:
             alarm_data = json.loads(payload)
@@ -158,11 +198,15 @@ class CombinedScheduler:
                 'minute': alarm_data['minute'],
                 'action': alarm_data['action'],
                 'days': alarm_data['days'],
-                'enabled': True
-            }
+                'enabled': True,
+                'last_triggered': None
+                }
             
             self.alarms.append(alarm)
+            self.save_alarms()
+            
             logger.info(f"⏰ Alarm added: Switch {alarm['channel']} - {alarm['hour']:02d}:{alarm['minute']:02d} - {alarm['action']}")
+            logger.info(f"   Days: {alarm['days']}")
             self.client.publish(self.topic_status, f"ALARM_ADDED:{alarm['channel']}:{alarm['hour']:02d}:{alarm['minute']:02d}")
             
         except Exception as e:
@@ -172,10 +216,11 @@ class CombinedScheduler:
         try:
             alarm_id = int(payload)
             self.alarms = [a for a in self.alarms if a['id'] != alarm_id]
+            self.save_alarms()
             logger.info(f"🗑 Alarm {alarm_id} deleted")
             self.client.publish(self.topic_status, f"ALARM_DELETED:{alarm_id}")
-        except:
-            logger.error("❌ Error deleting alarm")
+        except Exception as e:
+            logger.error(f"❌ Error deleting alarm: {e}")
     
     # ========== CALENDAR FUNCTIONS ==========
     def load_events(self):
@@ -208,7 +253,12 @@ class CombinedScheduler:
             
             event = {
                 'id': event_data['id'],
-                'datetime': event_datetime.strftime("%Y-%m-%d %H:%M"),
+                'datetime': event_datetime_str,  # Keep as string
+                'year': event_datetime.year,
+                'month': event_datetime.month,
+                'day': event_datetime.day,
+                'hour': event_datetime.hour,
+                'minute': event_datetime.minute,
                 'switch': event_data['switch'],
                 'action': event_data['action'],
                 'label': event_data.get('label', 'Calendar Event'),
@@ -221,6 +271,7 @@ class CombinedScheduler:
             
             logger.info(f"📅 Event added: {event['label']}")
             logger.info(f"   {event['datetime']} - Switch {event['switch']} - {event['action']}")
+            logger.info(f"   Repeat: {event['repeatMode']}")
             self.client.publish(self.topic_status, f"CALENDAR_ADDED:{event['id']}")
             
         except Exception as e:
@@ -238,7 +289,6 @@ class CombinedScheduler:
                 self.client.publish(self.topic_status, f"CALENDAR_DELETED:{event_id}")
             else:
                 logger.warning(f"⚠️ Event {event_id} not found")
-                
         except Exception as e:
             logger.error(f"💥 Error deleting event: {e}")
     
@@ -264,44 +314,76 @@ class CombinedScheduler:
         now = datetime.now()
         current_hour = now.hour
         current_minute = now.minute
-        current_day = now.weekday() + 1  # Monday=1, Sunday=7
+        current_day = now.weekday()  # Monday=0, Sunday=6
+        current_date_str = now.strftime("%Y-%m-%d")
+        
+        logger.debug(f"Checking alarms at {current_hour:02d}:{current_minute:02d} on day {current_day}")
         
         for alarm in self.alarms:
-            if (alarm['enabled'] and 
-                alarm['hour'] == current_hour and 
-                alarm['minute'] == current_minute and
-                current_day in alarm['days']):
+            if not alarm['enabled']:
+                continue
                 
-                logger.info(f"🚨 ALARM TRIGGERED: Switch {alarm['channel']}")
-                switch_topic = f"{self.topic_switch_base}{alarm['channel']}"
-                self.client.publish(switch_topic, alarm['action'])
-                self.client.publish(self.topic_status, f"ALARM_TRIGGERED:{alarm['channel']}")
+            # Check if already triggered today
+            last_triggered = alarm.get('last_triggered')
+            if last_triggered == current_date_str:
+                continue
+                
+            # Check time
+            if alarm['hour'] != current_hour or alarm['minute'] != current_minute:
+                continue
+                
+            # Check day (convert to 0-based indexing)
+            alarm_days = [day - 1 for day in alarm['days']]  # Convert from 1-7 to 0-6
+            if current_day not in alarm_days:
+                continue
+            
+            # Trigger alarm
+            logger.info(f"🚨 ALARM TRIGGERED: Switch {alarm['channel']} at {alarm['hour']:02d}:{alarm['minute']:02d}")
+            switch_topic = f"{self.topic_switch_base}{alarm['channel']}"
+            self.client.publish(switch_topic, alarm['action'])
+            self.client.publish(self.topic_status, f"ALARM_TRIGGERED:{alarm['channel']}")
+            
+            # Mark as triggered today
+            alarm['last_triggered'] = current_date_str
+            self.save_alarms()
     
     def should_execute_event(self, event, now):
         if not event['enabled']:
             return False
         
-        event_time = datetime.strptime(event['datetime'], "%Y-%m-%d %H:%M")
-        current_time = now.replace(second=0, microsecond=0)
-        event_time = event_time.replace(year=now.year, month=now.month, day=now.day)
-        if event_time != current_time:
+        # Parse event time
+        event_hour = event['hour']
+        event_minute = event['minute']
+        
+        # Check if time matches
+        if now.hour != event_hour or now.minute != event_minute:
+            return False
+        
+        # Check if already executed this minute
+        current_time_str = now.strftime("%Y-%m-%d %H:%M")
+        if event.get('lastExecuted') == current_time_str:
             return False
         
         repeat_mode = event['repeatMode']
-        original_event_date = datetime.strptime(event['datetime'], "%Y-%m-%d %H:%M")
         
         if repeat_mode == 'once':
-            return original_event_date.date() == now.date()
+            # Check if it's the exact date
+            event_date = datetime(event['year'], event['month'], event['day'])
+            return event_date.date() == now.date()
+            
         elif repeat_mode == 'daily':
             return True
+            
         elif repeat_mode == 'weekly':
-            return original_event_date.weekday() == now.weekday()
+            event_date = datetime(event['year'], event['month'], event['day'])
+            return event_date.weekday() == now.weekday()
+            
         elif repeat_mode == 'monthly':
-            return original_event_date.day == now.day
+            return event['day'] == now.day
+            
         elif repeat_mode == 'yearly':
-            return (original_event_date.month == now.month and 
-                    original_event_date.day == now.day)
-        
+            return event['month'] == now.month and event['day'] == now.day
+            
         return False
     
     def check_events(self):
@@ -309,20 +391,17 @@ class CombinedScheduler:
         
         for event in self.events:
             if self.should_execute_event(event, now):
-                last_executed = event.get('lastExecuted')
-                if last_executed and last_executed == now.strftime("%Y-%m-%d %H:%M"):
-                    continue
-                    
-                logger.info(f"🎯 CALENDAR EVENT: {event['label']}")
+                logger.info(f"🎯 CALENDAR EVENT: {event['label']} at {now.strftime('%H:%M')}")
                 switch_topic = f"{self.topic_switch_base}{event['switch']}"
                 self.client.publish(switch_topic, event['action'])
                 self.client.publish(self.topic_status, f"CALENDAR_TRIGGERED:{event['id']}")
                 
+                # Update last executed
                 event['lastExecuted'] = now.strftime("%Y-%m-%d %H:%M")
                 self.save_events()
     
     # ========== MQTT HANDLERS ==========
-    def on_connect(self, client, userdata, flags, rc):
+    def on_connect(self, client, userdata, flags, rc, properties=None):
         if rc == 0:
             logger.info("✅ Connected to MQTT broker")
             
@@ -347,6 +426,8 @@ class CombinedScheduler:
         try:
             topic = msg.topic
             payload = msg.payload.decode('utf-8')
+            
+            logger.info(f"📨 Received on {topic}: {payload[:100]}...")
             
             if topic == self.topic_add_timer:
                 self.add_timer(payload)
@@ -432,7 +513,7 @@ def home():
     return jsonify({
         "status": "online",
         "service": "Minte Smart Switch Scheduler",
-        "endpoints": ["/health", "/status", "/mqtt"],
+        "endpoints": ["/health", "/status", "/mqtt", "/schedules"],
         "docs": {
             "timer": "Publish to 'philos/timer/add' with JSON: {'id':'unique','hours':0,'minutes':5,'seconds':0,'switch':1,'action':'ON','label':'Timer'}",
             "alarm": "Publish to 'smart/alarm/add' with JSON: {'channel':1,'hour':8,'minute':30,'action':'ON','days':[1,2,3,4,5]}",
@@ -442,7 +523,12 @@ def home():
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
+    return jsonify({
+        "status": "healthy", 
+        "timestamp": datetime.now().isoformat(),
+        "utc_time": datetime.utcnow().isoformat(),
+        "local_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    })
 
 @app.route('/status')
 def status():
@@ -452,7 +538,29 @@ def status():
             "timers": len(scheduler.timers),
             "alarms": len(scheduler.alarms),
             "events": len(scheduler.events),
-            "mqtt_connected": scheduler.client.is_connected() if hasattr(scheduler, 'client') else False
+            "mqtt_connected": scheduler.client.is_connected() if hasattr(scheduler, 'client') else False,
+            "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "server_timezone": "UTC (Render default)"
+        })
+    return jsonify({"error": "Scheduler not initialized"})
+
+@app.route('/schedules')
+def schedules():
+    """Show all active schedules"""
+    scheduler = app.config.get('scheduler')
+    if scheduler:
+        return jsonify({
+            "timers": [
+                {
+                    "id": t["id"],
+                    "label": t["label"],
+                    "ends_at": t["end_time"].strftime("%H:%M:%S") if isinstance(t["end_time"], datetime) else t["end_time"],
+                    "switch": t["switch"],
+                    "action": t["action"]
+                } for t in scheduler.timers
+            ],
+            "alarms": scheduler.alarms,
+            "events": scheduler.events
         })
     return jsonify({"error": "Scheduler not initialized"})
 
@@ -497,6 +605,7 @@ def main():
         
         logger.info(f"🌐 Starting Flask server on port {port}")
         logger.info(f"🌍 Service URL: https://smartswitchcloud.onrender.com")
+        logger.info(f"🕐 Server time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         # Start Flask server
         app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
