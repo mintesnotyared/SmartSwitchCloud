@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class CombinedScheduler:
-    def init(self):
+    def __init__(self):
         # Initialize client first
         self.client = mqtt.Client()
         self.client.on_connect = self.on_connect
